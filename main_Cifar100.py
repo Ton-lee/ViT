@@ -457,11 +457,11 @@ def main():
         image_size=32,
         patch_size=4,
         num_classes=100,
-        dim=384,
-        depth=7,
-        heads=12,
-        mlp_dim=384,
-        dropout=0.5,
+        dim=256,
+        depth=4,
+        heads=6,
+        mlp_dim=256,
+        dropout=0.1,
         emb_dropout=0.1
     )
     model = model.to(device)
@@ -539,9 +539,11 @@ def main():
                         best_epoch = epoch
                         torch.save(model.state_dict(),
                                    os.path.join(args.save_dir, args.exp_name, f'model_best_loss.pth'))
+                        print(f"Best Loss: {best_loss:.4f}")
                     if f1 > best_F1:
                         best_F1 = f1
                         torch.save(model.state_dict(), os.path.join(args.save_dir, args.exp_name, f'model_best_F1.pth'))
+                        print(f"Best F1: {best_F1:.4f}")
 
     elif args.mode == 'val':
         assert args.val_txt, "--val_txt is required in val mode"
