@@ -465,10 +465,10 @@ def main():
         image_size=224,
         patch_size=16,
         num_classes=100,
-        dim=1024,
-        depth=16,
-        heads=16,
-        mlp_dim=4096,
+        dim=768,
+        depth=12,
+        heads=12,
+        mlp_dim=3072,
         dropout=0.1,
         emb_dropout=0.1
     )
