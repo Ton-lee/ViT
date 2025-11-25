@@ -6,6 +6,7 @@ from PIL import Image
 import tqdm
 import torch
 import torch.nn as nn
+from vit_pytorch import ViT
 import torch.optim as optim
 from torchvision import transforms
 import torchvision.models as models
@@ -460,10 +461,17 @@ def main():
     transform = get_transform()
     transform_val = get_val_transform()
     
-    # 使用Vision Transformer替换ResNet
-    model = models.vit_b_16(weights=ViT_B_16_Weights.DEFAULT)
-    # 修改分类头以适应100个类别
-    model.heads.head = nn.Linear(model.heads.head.in_features, 100)
+    model = ViT(
+        image_size=224,
+        patch_size=16,
+        num_classes=100,
+        dim=1024,
+        depth=16,
+        heads=16,
+        mlp_dim=4096,
+        dropout=0.1,
+        emb_dropout=0.1
+    )
     model = model.to(device)
     model = DDP(model, device_ids=[local_rank])
 
@@ -537,11 +545,13 @@ def main():
                     if loss < best_loss:
                         best_loss = loss
                         best_epoch = epoch
-                        torch.save(model.state_dict(), os.path.join(args.save_dir, args.exp_name, f'model_best_loss.pth'))
+                        torch.save(model.state_dict(),
+                                   os.path.join(args.save_dir, args.exp_name, f'model_best_loss.pth'))
+                        print(f"Best Loss: {best_loss:.4f}")
                     if f1 > best_F1:
                         best_F1 = f1
                         torch.save(model.state_dict(), os.path.join(args.save_dir, args.exp_name, f'model_best_F1.pth'))
-
+                        print(f"Best F1: {best_F1:.4f}")
     elif args.mode == 'val':
         assert args.val_txt, "--val_txt is required in val mode"
         if args.extract_features:
