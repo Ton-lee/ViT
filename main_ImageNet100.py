@@ -22,6 +22,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import argparse
 import faiss
+import json
 
 
 import datetime
@@ -65,20 +66,6 @@ def setup_ddp():
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     return local_rank
-
-
-class Tee:
-    def __init__(self, *files):
-        self.files = files
-
-    def write(self, obj):
-        for f in self.files:
-            f.write(obj)
-            f.flush()
-
-    def flush(self):
-        for f in self.files:
-            f.flush()
 
 
 IMG_SIZE = (224, 224)
@@ -460,20 +447,36 @@ def main():
 
     transform = get_transform()
     transform_val = get_val_transform()
-    
-    model = ViT(
-        image_size=224,
-        patch_size=16,
-        num_classes=100,
-        dim=512,
-        depth=8,
-        heads=8,
-        mlp_dim=2048,
-        dropout=0.1,
-        emb_dropout=0.1
-    )
+
+    model_config = {
+        'image_size': 224,
+        'patch_size': 16,
+        'num_classes': 100,
+        'dim': 512,
+        'depth': 8,
+        'heads': 8,
+        'mlp_dim': 2048,
+        'dropout': 0.1,
+        'emb_dropout': 0.1
+    }
+
+    model = ViT(**model_config)
     model = model.to(device)
     model = DDP(model, device_ids=[local_rank])
+    config_data = {
+        'training_args': vars(args),  # 将 argparse 命名空间转换为字典
+        'model_config': model_config,
+        'environment_info': {
+            'local_rank': local_rank,
+            'device': str(device),
+            'world_size': dist.get_world_size() if dist.is_initialized() else 1,
+            'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+    }
+    config_file = os.path.join(args.save_dir, args.exp_name, 'config.json')
+    with open(config_file, 'w', encoding='utf-8') as f:
+        json.dump(config_data, f, indent=4, ensure_ascii=False)
+    print(f"Configuration saved to: {config_file}")
 
     if args.mode == 'train':
         assert args.train_txt, "--train_txt is required in train mode"

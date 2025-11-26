@@ -2,3 +2,5 @@
 /checkpoints_Cifar100/
 /checkpoints_Contrast/
 /results/
+/checkpoints_ImageNet100/
+/checkpoints_Cifar100-LT/
