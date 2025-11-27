@@ -5,17 +5,17 @@ import clip
 from PIL import Image
 import tqdm
 import torch
-from vit_pytorch import ViT
 import torch.nn as nn
+from vit_pytorch import ViT
 import torch.optim as optim
 from torchvision import transforms
 import torchvision.models as models
 from torchvision.models import ViT_B_16_Weights
+import torch.nn.functional as F
 from sklearn.metrics import classification_report, accuracy_score, confusion_matrix, ConfusionMatrixDisplay, \
     precision_recall_fscore_support
 from torch.utils.data import Dataset, DataLoader
 import matplotlib
-
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
@@ -25,6 +25,31 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import argparse
 import faiss
 import json
+import math
+import datetime
+
+
+# DATASET CONFIG
+IMG_SIZE = 32
+CLASS_NUM = 100
+ROOT = "/home/Users/dqy/Dataset/Cifar100"
+IMAGE_ROOT_TRAIN = f"{ROOT}/format_ImageNet/images/train/"
+MEAN = [0.5071, 0.4867, 0.4408]
+STD = [0.2675, 0.2565, 0.2761]
+# TRAINING STRATEGY
+STRATEGY = "none"
+WEIGHTS_PATH = f"{ROOT}/weights#{STRATEGY}.pt"
+NUM_PATH = f"{ROOT}/class_nums.pt"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# MODEL CONFIG
+PATCH_SIZE = 4
+ViT_DIM = 256
+ViT_DEPTH = 4
+ViT_HEAD = 6
+ViT_MLP_DIM = 256
+ViT_DROPOUT = 0.1
+ViT_EMB_DROPOUT = 0.1
+
 
 
 def setup_ddp():
@@ -32,9 +57,6 @@ def setup_ddp():
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     return local_rank
-
-
-import datetime
 
 
 class Tee:
@@ -70,14 +92,39 @@ class Tee:
             f.flush()
 
 
-IMG_SIZE = (32, 32)
-STRATEGY = "none"
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-WEIGHTS_PATH = f"/home/Users/dqy/Dataset/Cifar100/weights#{STRATEGY}.pt"
+class LDAMLoss(nn.Module):
+    def __init__(self, cls_num_list, max_margin=0.5, weight=None, s=30):
+        super(LDAMLoss, self).__init__()
+        self.cls_num_list = cls_num_list
+        self.max_margin = max_margin
+        self.s = s
+
+        # 计算每个类别的边际
+        m_list = 1.0 / np.sqrt(np.sqrt(cls_num_list))
+        m_list = m_list * (max_margin / np.max(m_list))
+        self.m_list = torch.tensor(m_list, dtype=torch.float).to(DEVICE)
+
+        # 类别权重
+        if weight is not None:
+            self.weight = weight
+        else:
+            self.weight = None
+
+    def forward(self, x, target):
+        index = torch.zeros_like(x, dtype=torch.bool)
+        index.scatter_(1, target.data.view(-1, 1), 1)
+
+        # 应用边际
+        x_m = x - self.m_list * index
+
+        output = torch.where(index, x_m, x)
+
+        # 计算交叉熵损失
+        return F.cross_entropy(self.s * output, target, weight=self.weight)
 
 
 def name_to_label():
-    root = "/home/Users/dqy/Dataset/Cifar100/format_ImageNet/images/train/"
+    root = IMAGE_ROOT_TRAIN
     categories = sorted(os.listdir(root))
     mapping = {category: idx for idx, category in enumerate(categories)}
     return mapping
@@ -105,8 +152,8 @@ class CustomImageDataset(Dataset):
     def __getitem__(self, idx):
         img = cv2.imread(self.image_paths[idx])
         if img is None:
-            img = np.zeros((IMG_SIZE[0], IMG_SIZE[1], 3), dtype=np.uint8)
-        img = cv2.resize(img, IMG_SIZE)
+            img = np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
+        img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = self.transform(img)
         return img, self.labels[idx], os.path.basename(self.image_paths[idx])
@@ -115,13 +162,12 @@ class CustomImageDataset(Dataset):
 def get_transform():
     return transforms.Compose([
         transforms.ToPILImage(),
-        transforms.RandomCrop(32, padding=4),
+        transforms.RandomCrop(IMG_SIZE, padding=4),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
         transforms.RandomRotation(15),
         transforms.ToTensor(),
-        transforms.Normalize([0.5071, 0.4867, 0.4408],
-                             [0.2675, 0.2565, 0.2761])
+        transforms.Normalize(MEAN, STD)
     ])
 
 
@@ -129,12 +175,11 @@ def get_val_transform():
     return transforms.Compose([
         transforms.ToPILImage(),
         transforms.ToTensor(),
-        transforms.Normalize([0.5071, 0.4867, 0.4408],
-                             [0.2675, 0.2565, 0.2761])
+        transforms.Normalize(MEAN, STD)
     ])
 
 
-def calculate_class_weights(dataset, num_classes=100, method='inverse', beta=0.999):
+def calculate_class_weights(dataset, num_classes=CLASS_NUM, method='inverse', beta=0.999):
     """
     计算类别权重
     Args:
@@ -190,8 +235,8 @@ def calculate_class_weights(dataset, num_classes=100, method='inverse', beta=0.9
 
 
 def reverse_transform(images):
-    mean = torch.tensor([0.5071, 0.4867, 0.4408]).view(1, 3, 1, 1).to(images.device)  # 转为 [1, C, 1, 1] 方便广播
-    std = torch.tensor([0.2675, 0.2565, 0.2761]).view(1, 3, 1, 1).to(images.device)
+    mean = torch.tensor(MEAN).view(1, 3, 1, 1).to(images.device)
+    std = torch.tensor(STD).view(1, 3, 1, 1).to(images.device)
     tensor_denormalized = images * std + mean
     image_np = tensor_denormalized.cpu().numpy().transpose(0, 2, 3, 1) * 255
     image_np = np.clip(image_np, 0, 255).astype(np.uint8)
@@ -231,7 +276,7 @@ def softmax(x):
     return e_x / e_x.sum(axis=0)
 
 
-def train(model, train_loader, criterion, optimizer, scheduler, device, class_weights=None):
+def train(model, train_loader, criterion, optimizer, scheduler, device, class_weights=None, args=None):
     model.train()
     total_loss = 0
     num_batch = 0
@@ -239,9 +284,10 @@ def train(model, train_loader, criterion, optimizer, scheduler, device, class_we
         images, labels = images.to(device), labels.to(device)
         optimizer.zero_grad()
         outputs = model(images)
-        loss = criterion(outputs, labels)
-        # 如果有类别权重，应用到损失计算
-        if class_weights is not None:
+        if args.use_ldam:
+            loss = criterion(outputs, labels)
+        elif class_weights is not None:
+            # 如果有类别权重，应用到损失计算
             weight = class_weights[labels].to(device)
             loss = criterion(outputs, labels)
             loss = (loss * weight).mean()  # 加权平均
@@ -262,6 +308,9 @@ def validate(model, val_loader, criterion, label_map, device, extract_features=F
     results = []
     total_loss = 0.0
     num_samples = 0
+
+    # 验证时使用标准交叉熵损失
+    val_criterion = nn.CrossEntropyLoss()
 
     # ViT特征提取器 - 获取分类前的特征
     def get_vit_features(model, x):
@@ -329,7 +378,8 @@ def validate(model, val_loader, criterion, label_map, device, extract_features=F
                         for dist, idx in zip(dists, indices):
                             path = CLIP_paths[idx]
                             filename = os.path.basename(path)
-                            category = filename.split("#")[1].split("_")[0]
+                            assert len(filename.split("#")) == 3, "Filename format error in key frames"
+                            category = filename.split("#")[1]  # 保证格式为 kernal_XX#category#name.XX
                             label = label_map[category]
 
                             label_count[label] = label_count.get(label, 0) + 1
@@ -378,7 +428,7 @@ def validate(model, val_loader, criterion, label_map, device, extract_features=F
                     device) * prior_weight
                 outputs = model.module.heads(cls_features)
 
-            loss = criterion(outputs, labels)
+            loss = val_criterion(outputs, labels)
             total_loss += loss.mean().item() * images.size(0)
             num_samples += images.size(0)
             preds = torch.argmax(outputs, dim=1)
@@ -442,6 +492,11 @@ def main():
     parser.add_argument('--prior_weight', type=float, default=0.0)
     parser.add_argument('--only_retrieval', action='store_true')
     parser.add_argument('--result_json', type=str, default='', help='Path to save validation results in JSON format')
+    # 使用 LDAM Loss
+    parser.add_argument('--use_ldam', action='store_true', help='Use LDAM loss for long-tailed distribution')
+    parser.add_argument('--max_margin', type=float, default=0.5, help='Max margin for LDAM loss')
+    parser.add_argument('--scale', type=float, default=30.0, help='Scale factor for LDAM loss')
+    parser.add_argument('--drw_epoch', type=int, default=160, help='Epoch to start deferred re-weighting')
     args = parser.parse_args()
 
     local_rank = setup_ddp()
@@ -455,15 +510,15 @@ def main():
     transform_val = get_val_transform()
 
     model_config = {
-        'image_size': 32,
-        'patch_size': 4,
-        'num_classes': 100,
-        'dim': 256,
-        'depth': 4,
-        'heads': 6,
-        'mlp_dim': 256,
-        'dropout': 0.1,
-        'emb_dropout': 0.1
+        'image_size': IMG_SIZE,
+        'patch_size': PATCH_SIZE,
+        'num_classes': CLASS_NUM,
+        'dim': ViT_DIM,
+        'depth': ViT_DEPTH,
+        'heads': ViT_HEAD,
+        'mlp_dim': ViT_MLP_DIM,
+        'dropout': ViT_DROPOUT,
+        'emb_dropout': ViT_EMB_DROPOUT
     }
 
     model = ViT(**model_config)
@@ -497,12 +552,13 @@ def main():
                                   prefetch_factor=2)  # 预取因子)
         # 计算类别权重
         if dist_rank == 0:
-            print("Calculating class weights...")
+            print("Calculating class distribution...")
         if not os.path.exists(WEIGHTS_PATH):
-            class_weights = calculate_class_weights(train_loader, num_classes=100, method=STRATEGY)
+            class_weights = calculate_class_weights(train_loader, num_classes=CLASS_NUM, method=STRATEGY)
             torch.save(class_weights.cpu(), WEIGHTS_PATH)
         else:
             class_weights = torch.load(WEIGHTS_PATH).to(DEVICE)
+
         if args.val_txt:
             val_dataset = CustomImageDataset(args.val_txt, transform_val, label_map)
             val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
@@ -510,9 +566,27 @@ def main():
                                     pin_memory=True,  # 启用pin_memory
                                     persistent_workers=True,  # 保持worker进程
                                     prefetch_factor=2)  # 预取因子
-            best_loss, best_epoch, best_F1 = 10000, -1, 0
+        best_loss, best_epoch, best_F1 = 10000, -1, 0
+        cls_num_list = torch.zeros(100, dtype=torch.long)
+        if args.use_ldam:
+            # 统计每个类别的样本数
+            if not os.path.exists(NUM_PATH):
+                for _, labels, _ in train_loader:
+                    for label in labels:
+                        cls_num_list[label] += 1
+                torch.save(cls_num_list, NUM_PATH)
+            else:
+                cls_num_list = torch.load(NUM_PATH)
 
-        criterion = nn.CrossEntropyLoss(reduction='none')
+            # 创建 LDAM Loss
+            criterion = LDAMLoss(
+                cls_num_list=cls_num_list.cpu().numpy(),
+                max_margin=args.max_margin,
+                weight=class_weights,  # 可选：结合类别权重
+                s=args.scale  # 缩放因子
+            )
+        else:
+            criterion = nn.CrossEntropyLoss(reduction='none')
         config = {
             'lr': args.lr,
             'weight_decay': args.weight_decay,
@@ -542,7 +616,13 @@ def main():
 
         for epoch in range(args.epochs):
             train_sampler.set_epoch(epoch)
-            loss = train(model, train_loader, criterion, optimizer, scheduler, device, class_weights)
+            # DRW策略：在后期应用重新加权
+            if epoch >= args.drw_epoch and args.use_ldam:  # 例如 args.drw_epoch = 160
+                # 重新计算权重（可选）
+                per_cls_weights = 1.0 / np.array(cls_num_list)
+                per_cls_weights = per_cls_weights / np.sum(per_cls_weights) * len(cls_num_list)
+                criterion.weight = torch.tensor(per_cls_weights, dtype=torch.float).to(device)
+            loss = train(model, train_loader, criterion, optimizer, scheduler, device, class_weights, args)
             if dist_rank == 0:
                 print(f"[Epoch {epoch + 1}] Train Loss: {loss:.4f} | lr: {scheduler.get_last_lr()[0]: .6f}")
                 model_save_path = os.path.join(args.save_dir, args.exp_name, f'model_latest.pth')

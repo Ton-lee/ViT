@@ -635,9 +635,11 @@ def main():
                         best_epoch = epoch
                         torch.save(model.state_dict(),
                                    os.path.join(args.save_dir, args.exp_name, f'model_best_loss.pth'))
+                        print(f"Best Loss: {best_loss:.4f}")
                     if f1 > best_F1:
                         best_F1 = f1
                         torch.save(model.state_dict(), os.path.join(args.save_dir, args.exp_name, f'model_best_F1.pth'))
+                        print(f"Best F1: {best_F1:.4f}")
 
     elif args.mode == 'val':
         assert args.val_txt, "--val_txt is required in val mode"
